@@ -1,0 +1,242 @@
+---
+title: "meffilTools"
+author: "Channing software teams"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteIndexEntry{meffilTools}
+  %\VignetteEncoding{UTF-8}
+output:
+  BiocStyle::html_document:
+    number_sections: yes
+    toc: yes
+bibliography: meth1.bib
+---
+
+# Introduction
+
+The meffil package (@Min2018) for Illumina Infinium methylation array analysis
+produces functionally normalized signal estimates in a memory-sparing disk
+format, GDS.
+
+The GDS format requires additional infrastructure
+for simple downstream
+manipulation.  We've converted all the betas to chromosome-specific HDF5 SummarizedExperiments.
+
+An example HDF5 SummarizedExperiment is provided
+with the pidsleyEPICData package.  The raw data are from
+NCBI GEO [GSE86831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE86831), as described in 
+@Pidsley2016.
+<!--, a [2016 Genome Biology
+paper](https://doi.org/10.1186/s13059-016-1066-1)
+by Pidsley and colleagues.
+-->
+
+```{r lk1}
+suppressPackageStartupMessages({
+library(HDF5Array)
+library(SummarizedExperiment)
+library(meffilTools)
+library(DelayedMatrixStats)
+library(BiocSingular)
+library(randomForest)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(pidsleyEPICData)
+})
+
+pidsSE = pidsleyEPICData::pidsleyData()
+pidsSE
+assay(pidsSE)
+```
+Fifteen arrays are provided in raw form at GSE86831.
+Biological source types are labeled in `Sample_Group`.
+```{r lktaba}
+table(pidsSE$Sample_Group)
+```
+"CAF" and "NAF" refer to paired samples of tumor-associated or normal fibroblasts.
+"LNCaP" refers to a transformed prostate cancer cell line.  "PrEC" denotes
+primary cell culture of prostate epithelial cells.  "Guthrie" samples
+are infant blood derived from "archival Guthrie cards".
+
+# Tasks supported by meffilTools
+
+Throughout the remainder, we will assume that the default
+processing of the arrays by meffil produces adequate
+estimates of "beta" for CpGs on the array.
+
+## Compute the ICCs for a set of CpGs
+
+We use `nlme::gls`.  A function must be
+defined to derive a suitable data.frame from the assay results for
+a feature.  An example is shown below.
+
+```{r lkicc,eval=TRUE}
+library(HDF5Array)
+library(SummarizedExperiment)
+makedf_simple = function(se, ...) {
+  stopifnot(nrow(se)==1)
+  data.frame(beta=as.numeric(SummarizedExperiment::assay(se)),
+       id=as.numeric(factor(se$Sample_Group)))
+}
+get_iccs(pidsSE, inds=51:60, makedf.in=makedf_simple, fixedfmla = beta~1)
+```
+
+We can elaborate the GDS model by changing the makedf and fixedfmla.
+```{r do2}
+makedf_celltype = function(se, ...) {
+  stopifnot(nrow(se)==1)
+  data.frame(beta=as.numeric(SummarizedExperiment::assay(se)),
+       ngc=factor(!(se$Sample_Group %in% c("Guthrie", "CAF"))),
+       id=as.numeric(factor(se$Sample_Group)))
+}
+get_iccs(pidsSE, inds=51:60, makedf.in=makedf_celltype, fixedfmla = beta~ngc)
+```
+This illustrates the sensitivity of ICC estimation to the model
+for the mean response.
+
+## Exploration of differential methylation
+
+Selection of useful features can proceed by many
+avenues.  We'll use a very aggressive approach to
+clarify some of the issues.
+
+### Approximate PCA with non-specific (MAD-based) filtering
+
+First we'll use approximate principal components
+analysis (PCA to 6 components via the "implicitly restarted Lanczos bidiagonalization
+algorithm" in the irlba package, interfaced in BiocSingular) to look
+at adequacy of small numbers of probes for discriminating
+the cell types in the Pidsley dataset.
+
+#### PCA after Non-specific filtering by MAD over samples
+
+
+```{r lkdel,cache=FALSE}
+allm = rowMads(assay(pidsSE))
+omads = order(allm, decreasing=TRUE)
+topq = quantile(allm, c(.999, .9995, .9998, .9999))
+top45 = pidsSE[omads[seq_len(45)],]
+dim(top45)
+```
+
+```{r dorepcode}
+rept_filtse = function(se, sampvar = "Sample_Group", bspar=IrlbaParam(), npc=6) {
+  options(BiocSingularParam.default=bspar)
+  xxt = runPCA(t(assay(se)), rank=npc, BSPARAM=bsparam())
+  newdf = data.frame(y=factor(colData(se)[[sampvar]]), x=as.data.frame(t(assay(se))))
+  rf1 = randomForest(y~., data=newdf, importance=TRUE)
+  ans = list(pcaout=xxt, rfout=rf1, xlabs=colData(se)[[sampvar]])
+  class(ans) = "reportObj"
+  ans
+}
+
+summary.reportObj = function(object, ...) {
+  xxt = object$pcaout
+  par(mfrow=c(1,2), mar=c(4,3,2,2))
+  stats:::biplot.prcomp(xxt, xlabs=top45$Sample_Group, cex=c(.8,.4))
+  stats:::biplot.prcomp(xxt, xlabs=top45$Sample_Group, choices=2:3, cex=c(.8,.4))
+  print(object$rfout)
+  varImpPlot(object$rfout, n.var=15)
+}
+```
+
+We start with the `r nrow(top45)` most variable probes on chr6.
+
+These biplots show that PrEC, LNCaP, and Guthries
+cells can be distinguished, and replicates grouped
+well together, using PC1 and PC2 on `r nrow(top45)` probes, but NAF and
+CAF cells are grouped together.
+
+A very informal measure of discriminative capacity
+of nonspecifically selected probes is given by
+random forests.
+
+
+```{r doittttp}
+set.seed(1234)
+o45 = rept_filtse(top45)
+summary(o45)
+```
+
+### Approximate PCA with annotation-based filtering
+
+We'll use a 2000bp upstream, 200bp downstream gene-based
+filter to isolate probes in promoter regions.
+
+First we'll filter the probes in `pidsSE` to those lying in
+promoter regions, and bind associated gene symbols.
+```{r doanno,cache=FALSE}
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+g19 = genes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+p19 = promoters(g19)
+fo = findOverlaps(rowRanges(pidsSE), p19)
+pidsSE_prom = pidsSE[queryHits(fo),]
+rowRanges(pidsSE_prom)$gene_id = p19[subjectHits(fo)]$gene_id
+syms = mapIds(org.Hs.eg.db, keys=rowRanges(pidsSE_prom)$gene_id, 
+   keytype="ENTREZID", column="SYMBOL")
+rowRanges(pidsSE_prom)$symbol = syms
+head(rowRanges(pidsSE_prom), 4)
+```
+
+#### One CpG per promoter
+
+Now we'll pick one CpG per promoter, and again filter to
+the probes with largest cross-sample MAD.
+
+```{r dofilts, cache=TRUE}
+gg = split(pidsSE_prom, rowRanges(pidsSE_prom)$symbol)  # used below for anticorr
+pmads = rowMads(assay(pidsSE_prom))
+names(pmads) = rownames(pidsSE_prom)
+allmp = split(pmads, rowRanges(pidsSE_prom)$symbol)
+mmm = match(names(gg), names(allmp))
+allmp2 = allmp[mmm]
+stopifnot(all.equal(names(allmp2), names(gg)))
+topp = sapply(allmp2, function(x) names(which.max(x)))
+promse = pidsSE_prom[topp,]
+remm = rowMads(assay(promse)) # features are genes ~20K
+omads = order(remm, decreasing=TRUE)
+top45p = promse[ omads[seq_len(45)], ]
+```
+
+```{r doitttt}
+set.seed(1234)
+rownames(top45p) = rowRanges(top45p)$symbol
+o45p = rept_filtse(top45p)
+summary(o45p)
+```
+
+#### Adding an anti-correlated CpG
+
+Here we look for additional probes that are most
+negatively correlated with the probe in use.
+
+```{r addanti, eval=TRUE, cache=TRUE}
+find_anticorr = function(se, inuse) {
+ stopifnot(length(inuse)==1)
+ if (nrow(se)==1) return(inuse)
+ if (nrow(se)==2) return(setdiff(rownames(se), inuse))
+ ct = cor(t(as.matrix(assay(se))))
+ att = try(which.min(ct[inuse,]))
+ if (!inherits(att, "try-error")) return(names(att))
+ att
+}
+library(parallel)
+options(mc.cores=6)
+addcpg = mclapply(seq_len(length(gg)),
+   function(x) try(find_anticorr(gg[[x]], topp[x])))
+augmented = unique(c(topp, unlist(addcpg)))
+newse = pidsSE_prom[augmented,]
+```
+
+```{r doittttpp}
+remm2 = rowMads(assay(newse))
+orem = order(remm2, decreasing=TRUE)
+top2 = newse[ orem[seq_len(90)], ]
+set.seed(1234)
+rownames(top2) = rowRanges(top2)$symbol
+o2p = rept_filtse(top2)
+summary(o2p)
+```
+
+

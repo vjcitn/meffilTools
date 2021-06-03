@@ -1,0 +1,185 @@
+---
+title: "meffilTools 2"
+author: "Channing software teams"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteIndexEntry{meffilTools 2}
+  %\VignetteEncoding{UTF-8}
+output:
+  BiocStyle::html_document:
+    number_sections: yes
+    toc: yes
+bibliography: meth1.bib
+---
+
+# Introduction
+
+The meffil package (@Min2018) for Illumina Infinium methylation array analysis
+produces functionally normalized signal estimates in a memory-sparing disk
+format, GDS.
+
+The GDS format requires additional infrastructure
+for simple downstream
+manipulation.  We've converted all the betas to chromosome-specific HDF5 SummarizedExperiments.
+
+An example HDF5 SummarizedExperiment is provided
+with the pidsleyEPICData package.  The raw data are from
+NCBI GEO [GSE86831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE86831), as described in 
+@Pidsley2016.
+<!--, a [2016 Genome Biology
+paper](https://doi.org/10.1186/s13059-016-1066-1)
+by Pidsley and colleagues.
+-->
+
+```{r lk1}
+suppressPackageStartupMessages({
+library(HDF5Array)
+library(SummarizedExperiment)
+library(meffilTools)
+library(DelayedMatrixStats)
+library(BiocSingular)
+library(randomForest)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(pidsleyEPICData)
+})
+
+pidsSE = pidsleyEPICData::pidsleyData(FALSE)
+pidsSE
+assay(pidsSE)
+```
+Fifteen arrays are provided in raw form at GSE86831.
+Biological source types are labeled in `Sample_Group`.
+```{r lktaba}
+table(pidsSE$Sample_Group)
+```
+"CAF" and "NAF" refer to paired samples of tumor-associated or normal fibroblasts.
+"LNCaP" refers to a transformed prostate cancer cell line.  "PrEC" denotes
+primary cell culture of prostate epithelial cells.  "Guthrie" samples
+are infant blood derived from "archival Guthrie cards".
+
+# Tasks supported by meffilTools
+
+Throughout the remainder, we will assume that the default
+processing of the arrays by meffil produces adequate
+estimates of "beta" for CpGs on the array.
+
+## Compute the ICCs for a set of CpGs
+
+We use `nlme::gls`.  A function must be
+defined to derive a suitable data.frame from the assay results for
+a feature.  An example is shown below.
+
+```{r lkicc,eval=TRUE}
+library(HDF5Array)
+library(SummarizedExperiment)
+makedf_simple = function(se, ...) {
+  stopifnot(nrow(se)==1)
+  data.frame(beta=as.numeric(SummarizedExperiment::assay(se)),
+       id=as.numeric(factor(se$Sample_Group)))
+}
+get_iccs(pidsSE, inds=51:60, makedf.in=makedf_simple, fixedfmla = beta~1)
+```
+
+We can elaborate the GDS model by changing the makedf and fixedfmla.
+```{r do2}
+makedf_celltype = function(se, ...) {
+  stopifnot(nrow(se)==1)
+  data.frame(beta=as.numeric(SummarizedExperiment::assay(se)),
+       ngc=factor(!(se$Sample_Group %in% c("Guthrie", "CAF"))),
+       id=as.numeric(factor(se$Sample_Group)))
+}
+get_iccs(pidsSE, inds=51:60, makedf.in=makedf_celltype, fixedfmla = beta~ngc)
+```
+This illustrates the sensitivity of ICC estimation to the model
+for the mean response.
+
+## Exploration of differential methylation
+
+Selection of useful features can proceed by many
+avenues. 
+
+We'll use approximate principal components
+analysis (PCA to 6 components via the "implicitly restarted Lanczos bidiagonalization
+algorithm" in the irlba package, interfaced in BiocSingular) to look
+at adequacy of small numbers of probes for discriminating
+the cell types in the Pidsley dataset.
+
+### Filtering to the most variable CpG probes; reporting
+
+
+```{r lkdel,cache=FALSE}
+allm = rowMads(assay(pidsSE))
+omads = order(allm, decreasing=TRUE)
+top50 = pidsSE[omads[seq_len(50)],]
+dim(top50)
+```
+
+The `rept_filtse` function will compute approximate PCA
+and will use random forests to measure discriminative capacity
+in selected features.
+
+```{r doittttp}
+set.seed(1234)
+o50 = rept_filtse(top50)
+summary(o50)
+```
+
+The biplots show that PrEC, LNCaP, and Guthries
+cells can be distinguished, and replicates grouped
+well together, using PC1 and PC2 on `r nrow(top50)` probes, but NAF and
+CAF cells are grouped together.
+
+### Restricting attention to "promoter regions"
+
+```{r dopfilt}
+pidsSE_p = subset_to_promoters(pidsSE)
+pmads = rowMads(assay(pidsSE_p))
+opmads = order(pmads, decreasing=TRUE)
+top50_p = pidsSE_p[opmads[seq_len(50)],]
+o50_p = rept_filtse(top50_p)
+summary(o50_p)
+```
+Some annotation of CpG probes of interest is available in `epic_granges`.
+```{r lksan}
+epic_granges[c("cg00451642", "cg14674796")]
+```
+
+
+
+### Using a gene set
+
+In this section we use a set of genes identified in @Romanuik2010 defining
+an "LNCaP Atlas".  Our anticipation is that CpG probes in these genes
+will help isolate the LNCaP samples from the others.
+ 
+```{r nxt}
+lncap_activ = c("DHRS7", "GAS5", "PSMA7", "ELOVL5", "ENO2", "DHCR24", "FLNA", 
+"TMEM30A", "CCNH", "TRPM8", "MAOA", "OPRK1", "S100A10", "CUEDC2", 
+"HSD17B4", "STEAP1", "PTGFR", "PCGEM1")
+data(epic_granges)
+pidsSE_p = subset_to_promoters(pidsSE)
+inlac = epic_granges[which(epic_granges$in_prom %in% lncap_activ)]
+ok = intersect(names(inlac), rownames(pidsSE_p))
+inlacSE = pidsSE_p[ok,]
+rownames(inlacSE) = make.names(rowRanges(inlacSE)$symbol, unique=TRUE)
+olac = rept_filtse(inlacSE)
+summary(olac)
+```
+
+The marginal distributions of betas in promoter regions of several of these genes
+clearly distinguish LNCaP.
+
+```{r lkbox, fig.width=8}
+boxit = function(x)
+boxplot(split(as.numeric(assay(inlacSE[x,])), substr(inlacSE$Sample_Group,1,5)), ylab=sprintf("beta: %s", x))
+par(mfrow=c(2,2))
+boxit("S100A10.3")
+boxit("ENO2")
+boxit("TMEM30A.7")
+boxit("CCNH.6")
+```
+
+# References
+

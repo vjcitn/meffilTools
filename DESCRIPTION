@@ -1,0 +1,19 @@
+Package: meffilTools
+Title: helpers for meffil output
+Description: helpers for meffil output
+Version: 0.0.14
+Author: Vince Carey
+Suggests: knitr, rmarkdown,
+	HDF5Array, SummarizedExperiment,
+	BiocSingular, DelayedMatrixStats,
+	TxDb.Hsapiens.UCSC.hg19.knownGene, org.Hs.eg.db, randomForest
+Depends: R (>= 4.0), gdsfmt, BBmisc, parallel
+Imports: nlme, HDF5Array, SummarizedExperiment
+Maintainer: VJ Carey <stvjc@channing.harvard.edu>
+License: Artistic-2.0
+LazyLoad: yes
+LazyData: yes
+LazyDataCompression: xz
+VignetteBuilder: knitr
+RoxygenNote: 7.1.1
+Encoding: UTF-8

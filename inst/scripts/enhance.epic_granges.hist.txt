@@ -1,0 +1,15 @@
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+epic_opensea = rownames(Islands.UCSC[Islands.UCSC[,2]=="OpenSea",])
+save(epic_opensea, file="epic_opensea.rda", compress="xz")
+epic_granges$isl_class = Islands.UCSC[,2]
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+txdb = TxDb.Hsapiens.UCSC.hg19.knownGene
+g19 = genes(txdb)
+library(org.Hs.eg.db)
+syms = mapIds(org.Hs.eg.db, keys=g19$gene_id, keytype="ENTREZID", column="SYMBOL")
+g19$symbol = syms
+p19 = promoters(g19)
+pdat = findOverlaps(epic_granges, p19)
+epic_granges$in_prom = NA_character_
+epic_granges$in_prom[queryHits(pdat)] = p19$symbol[subjectHits(pdat)]
+save(epic_granges, file="epic_granges.rda", compress="xz")
